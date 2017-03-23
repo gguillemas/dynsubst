@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -11,10 +12,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/kms"
 )
 
 var (
+	table   string
 	profile string
+	inplace bool
 	sess    *session.Session
 )
 
@@ -23,8 +27,10 @@ const (
 )
 
 func init() {
+	var err error
 	flag.StringVar(&profile, "p", "default", "AWS profile to use")
-	sess, err := session.NewSession()
+	flag.BoolVar(&inplace, "i", false, "edit file in place")
+	sess, err = session.NewSession()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,28 +44,55 @@ func main() {
 		os.Exit(1)
 	}
 
-	input, err := ioutil.ReadAll(os.Stdin)
-	text := string(input)
+	table = args[0]
+	var file string
+	if len(args) > 1 {
+		file = args[1]
+	}
 
-	re := regexp.MustCompile(`{{((<state>\w+):)?(?<key>\w+)}}`)
+	var text string
+	if file == "" {
+		input, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			log.Fatal(err)
+		}
+		text = string(input)
+	} else {
+		input, err := ioutil.ReadFile(file)
+		if err != nil {
+			log.Fatal(err)
+		}
+		text = string(input)
+	}
+
+	re := regexp.MustCompile(`{{(\w+:)?\w+}}`)
 	output := re.ReplaceAllStringFunc(text, replaceFunc)
 
-	fmt.Println(output)
+	if inplace {
+		err := ioutil.WriteFile(file, []byte(output), 0)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		fmt.Println(output)
+	}
 }
 
 func replaceFunc(input string) string {
-	re := regexp.MustCompile(`{{((<state>\w+):)?(?<key>\w+)}}`)
+	var err error
+
+	re := regexp.MustCompile(`{{((?P<state>\w+):)?(?P<key>\w+)}}`)
 	matches := re.FindStringSubmatch(input)
 
 	var repl string
-	var encrypted bool
+	encrypted := false
 	for i, name := range re.SubexpNames() {
 		if name == "state" {
 			if matches[i] == stateEncrypted {
 				encrypted = true
 			}
 		} else if name == "key" {
-			repl, err := dynamoQuery(table, matches[i])
+			repl, err = dynamoQuery(sess, table, matches[i])
 			if err != nil {
 				log.Println(err)
 				return ""
@@ -67,10 +100,18 @@ func replaceFunc(input string) string {
 		}
 	}
 
+	if encrypted {
+		repl, err = kmsDecrypt(repl)
+		if err != nil {
+			log.Println(err)
+			return ""
+		}
+	}
+
 	return repl
 }
 
-func dynamoQuery(table, field string) (string, error) {
+func dynamoQuery(sess *session.Session, table, field string) (string, error) {
 	svc := dynamodb.New(sess)
 
 	queryInput := &dynamodb.QueryInput{
@@ -93,13 +134,32 @@ func dynamoQuery(table, field string) (string, error) {
 	}
 
 	if *resp.Count != 1 {
-		return "", fmt.Errorf("error querying for %v: %v occurrences found", field, *resp.Count)
+		return "", fmt.Errorf("error querying for \"%v\": %v occurrences found", field, *resp.Count)
 	}
 	s := resp.Items[0]["Value"].S
 
 	return *s, nil
 }
 
+func kmsDecrypt(b64 string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", err
+	}
+
+	decryptInput := &kms.DecryptInput{
+		CiphertextBlob: decoded,
+	}
+
+	svc := kms.New(sess)
+	res, err := svc.Decrypt(decryptInput)
+	if err != nil {
+		return "", err
+	}
+
+	return string(res.Plaintext), nil
+}
+
 func usage() {
-	fmt.Println("Usage: dynsubst [-p profile] table")
+	fmt.Println("Usage: dynsubst [flags] table [file]")
 }
