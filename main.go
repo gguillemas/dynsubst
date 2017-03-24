@@ -18,19 +18,35 @@ import (
 var (
 	table   string
 	profile string
+	region  string
 	inplace bool
 	sess    *session.Session
 )
 
 const (
 	stateEncrypted = "ENCRYPTED"
+	stateBase64    = "BASE64"
+	statePlain     = "PLAIN"
 )
 
 func init() {
 	var err error
+	flag.Usage = func() {
+		fmt.Println("Usage: dynsubst [flags] table [file]")
+		flag.PrintDefaults()
+	}
 	flag.StringVar(&profile, "p", "default", "AWS profile to use")
+	flag.StringVar(&region, "r", "", "AWS region to use")
 	flag.BoolVar(&inplace, "i", false, "edit file in place")
-	sess, err = session.NewSession()
+	awsConfig := aws.NewConfig()
+	if region != "" {
+		awsConfig = awsConfig.WithRegion(region)
+	}
+	sess, err = session.NewSessionWithOptions(session.Options{
+		Config:            *awsConfig,
+		Profile:           profile,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -40,7 +56,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
-		usage()
+		flag.Usage()
 		os.Exit(1)
 	}
 
@@ -84,15 +100,12 @@ func replaceFunc(input string) string {
 	re := regexp.MustCompile(`{{((?P<state>\w+):)?(?P<key>\w+)}}`)
 	matches := re.FindStringSubmatch(input)
 
-	var repl string
-	encrypted := false
+	var repl, state string
 	for i, name := range re.SubexpNames() {
 		if name == "state" {
-			if matches[i] == stateEncrypted {
-				encrypted = true
-			}
+			state = matches[i]
 		} else if name == "key" {
-			repl, err = dynamoQuery(sess, table, matches[i])
+			repl, err = dynamodbQuery(sess, table, matches[i])
 			if err != nil {
 				log.Println(err)
 				return ""
@@ -100,22 +113,35 @@ func replaceFunc(input string) string {
 		}
 	}
 
-	if encrypted {
+	switch state {
+	case stateEncrypted:
 		repl, err = kmsDecrypt(repl)
 		if err != nil {
 			log.Println(err)
 			return ""
 		}
+	case stateBase64:
+		dec, err := base64.StdEncoding.DecodeString(repl)
+		if err != nil {
+			log.Println(err)
+			return ""
+		}
+		repl = string(dec)
+	case statePlain:
+		fallthrough
+	default:
+		break
 	}
 
 	return repl
 }
 
-func dynamoQuery(sess *session.Session, table, field string) (string, error) {
+func dynamodbQuery(sess *session.Session, table, field string) (string, error) {
 	svc := dynamodb.New(sess)
 
 	queryInput := &dynamodb.QueryInput{
 		TableName: aws.String(table),
+		// TODO: Replace for KeyContidionExpression.
 		KeyConditions: map[string]*dynamodb.Condition{
 			"Key": {
 				ComparisonOperator: aws.String("EQ"),
@@ -158,8 +184,4 @@ func kmsDecrypt(b64 string) (string, error) {
 	}
 
 	return string(res.Plaintext), nil
-}
-
-func usage() {
-	fmt.Println("Usage: dynsubst [flags] table [file]")
 }
