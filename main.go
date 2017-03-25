@@ -16,35 +16,72 @@ import (
 )
 
 var (
-	table   string
-	profile string
-	region  string
-	inplace bool
-	sess    *session.Session
+	table, profile, region string
+	inplace, help          bool
+	sess                   *session.Session
 )
 
 const (
-	stateEncrypted = "ENCRYPTED"
-	stateBase64    = "BASE64"
-	statePlain     = "PLAIN"
+	// Retrieve value as is.
+	// This can be used in the case where a key coincidentally contains template syntax:
+	// Ex.: "{{GET:DECRYPT:Password}}" would retrieve the value of the "DECRYPT:Password" key.
+	// This is used as the default modifier when none is specified.
+	modGet = "GET"
+	// Decrypt value using AWS KMS.
+	modDecrypt = "DECRYPT"
+	// Remove SKIP modifier and do nothing else.
+	// This can be used in the case where the same file will be processed more than once.
+	// This option allows entries for different tables to be replaced in the same file.
+	// It can be used along with any amount of modifiers such as: "{{SKIP:DECRYPT:Password}}".
+	// Ex.: cat project.json | dynsubst project-settings | dynsubst project-credentials
+	modSkip = "SKIP"
+
+	helpMsg = `
+Replace placeholders for their value in an AWS DynamoDB table.
+Any key in between braces ("{{Key}}") is considered a placeholder.
+Input can be supplied either from the standard input or from a file.
+
+Placeholders accept the following modifiers:
+
+  {{GET:Key}}
+  Default. Will be replaced by the value of the "Key" key from AWS DynamoDB.
+  Example: "{{Username}}" will be replaced by the value of the "Username" key.
+  Example: "{{GET:Username}}" will be replaced by the value of the "Username" key.
+  Example: "{{GET:DECRYPT:Username}}" will be replaced by the value of the "DECRYPT:Username" key.
+
+  {{DECRYPT:Key}}
+  Will be replaced by the value of the "Key" key from AWS DynamoDB decrypted with AWS KMS.
+  Example: "{{DECRYPT:Password}}" will be replaced by the decrypted value of the "Password" key.
+
+  {{SKIP:Key}}
+  Will be replaced by the same placeholder after stripping the "SKIP" modifier.
+  Example: "{{SKIP:DECRYPT:Password}}" will be replaced by "{{DECRYPT:Password}}".
+`
 )
 
 func init() {
 	var err error
+
 	flag.Usage = func() {
 		fmt.Println("Usage: dynsubst [flags] table [file]")
 		flag.PrintDefaults()
+		if help {
+			fmt.Println(helpMsg)
+		}
 	}
-	flag.StringVar(&profile, "p", "default", "AWS profile to use")
-	flag.StringVar(&region, "r", "", "AWS region to use")
+	flag.StringVar(&profile, "p", "default", "specify AWS profile")
+	flag.StringVar(&region, "r", "", "specify AWS region")
 	flag.BoolVar(&inplace, "i", false, "edit file in place")
+	flag.BoolVar(&help, "h", false, "show extended help")
+
 	awsConfig := aws.NewConfig()
 	if region != "" {
 		awsConfig = awsConfig.WithRegion(region)
 	}
 	sess, err = session.NewSessionWithOptions(session.Options{
-		Config:            *awsConfig,
-		Profile:           profile,
+		Config:  *awsConfig,
+		Profile: profile,
+		// Force usage of shared AWS configuration.
 		SharedConfigState: session.SharedConfigEnable,
 	})
 	if err != nil {
@@ -81,10 +118,10 @@ func main() {
 		text = string(input)
 	}
 
-	re := regexp.MustCompile(`{{(\w+:)?\w+}}`)
+	re := regexp.MustCompile(`{{(\w+?:)?.+?}}`)
 	output := re.ReplaceAllStringFunc(text, replaceFunc)
 
-	if inplace {
+	if inplace && file != "" {
 		err := ioutil.WriteFile(file, []byte(output), 0)
 		if err != nil {
 			log.Fatal(err)
@@ -97,46 +134,41 @@ func main() {
 func replaceFunc(input string) string {
 	var err error
 
-	re := regexp.MustCompile(`{{((?P<state>\w+):)?(?P<key>\w+)}}`)
+	re := regexp.MustCompile(`{{((?P<mod>\w+?):)?(?P<key>.+?)}}`)
 	matches := re.FindStringSubmatch(input)
 
-	var repl, state string
+	var repl, mod string
 	for i, name := range re.SubexpNames() {
-		if name == "state" {
-			state = matches[i]
-		} else if name == "key" {
-			repl, err = dynamodbQuery(sess, table, matches[i])
-			if err != nil {
-				log.Println(err)
+		switch name {
+		case "mod":
+			mod = matches[i]
+		case "key":
+			if mod == modSkip {
+				repl = fmt.Sprintf("{{%s}}", matches[i])
 				return ""
+			} else {
+				repl, err = dynamodbQuery(table, matches[i])
+				if err != nil {
+					log.Println(err)
+					return ""
+				}
 			}
 		}
 	}
 
-	switch state {
-	case stateEncrypted:
+	if mod == modDecrypt {
 		repl, err = kmsDecrypt(repl)
 		if err != nil {
 			log.Println(err)
 			return ""
 		}
-	case stateBase64:
-		dec, err := base64.StdEncoding.DecodeString(repl)
-		if err != nil {
-			log.Println(err)
-			return ""
-		}
-		repl = string(dec)
-	case statePlain:
-		fallthrough
-	default:
-		break
 	}
 
 	return repl
 }
 
-func dynamodbQuery(sess *session.Session, table, field string) (string, error) {
+// Returns the string value for the AWS DynamoDB attribute named "Value" for the key specified.
+func dynamodbQuery(table, key string) (string, error) {
 	svc := dynamodb.New(sess)
 
 	queryInput := &dynamodb.QueryInput{
@@ -147,7 +179,7 @@ func dynamodbQuery(sess *session.Session, table, field string) (string, error) {
 				ComparisonOperator: aws.String("EQ"),
 				AttributeValueList: []*dynamodb.AttributeValue{
 					{
-						S: &field,
+						S: &key,
 					},
 				},
 			},
@@ -160,15 +192,15 @@ func dynamodbQuery(sess *session.Session, table, field string) (string, error) {
 	}
 
 	if *resp.Count != 1 {
-		return "", fmt.Errorf("error querying for \"%v\": %v occurrences found", field, *resp.Count)
+		return "", fmt.Errorf("error querying for \"%v\": %v occurrences found", key, *resp.Count)
 	}
 	s := resp.Items[0]["Value"].S
 
 	return *s, nil
 }
 
-func kmsDecrypt(b64 string) (string, error) {
-	decoded, err := base64.StdEncoding.DecodeString(b64)
+func kmsDecrypt(value string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
 		return "", err
 	}
