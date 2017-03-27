@@ -144,8 +144,7 @@ func replaceFunc(input string) string {
 			mod = matches[i]
 		case "key":
 			if mod == modSkip {
-				repl = fmt.Sprintf("{{%s}}", matches[i])
-				return ""
+				return fmt.Sprintf("{{%s}}", matches[i])
 			} else {
 				repl, err = dynamodbQuery(table, matches[i])
 				if err != nil {
