@@ -60,8 +60,6 @@ Placeholders accept the following modifiers:
 )
 
 func init() {
-	var err error
-
 	flag.Usage = func() {
 		fmt.Println("Usage: dynsubst [flags] table [file]")
 		flag.PrintDefaults()
@@ -73,23 +71,11 @@ func init() {
 	flag.StringVar(&region, "r", "", "specify AWS region")
 	flag.BoolVar(&inplace, "i", false, "edit file in place")
 	flag.BoolVar(&help, "h", false, "show extended help")
-
-	awsConfig := aws.NewConfig()
-	if region != "" {
-		awsConfig = awsConfig.WithRegion(region)
-	}
-	sess, err = session.NewSessionWithOptions(session.Options{
-		Config:  *awsConfig,
-		Profile: profile,
-		// Force usage of shared AWS configuration.
-		SharedConfigState: session.SharedConfigEnable,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
 }
 
 func main() {
+	var err error
+
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
@@ -116,6 +102,20 @@ func main() {
 			log.Fatal(err)
 		}
 		text = string(input)
+	}
+
+	awsConfig := aws.NewConfig()
+	if region != "" {
+		awsConfig = awsConfig.WithRegion(region)
+	}
+	sess, err = session.NewSessionWithOptions(session.Options{
+		Config:  *awsConfig,
+		Profile: profile,
+		// Force usage of shared AWS configuration.
+		SharedConfigState: session.SharedConfigEnable,
+	})
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	re := regexp.MustCompile(`{{(\w+?:)?.+?}}`)
@@ -148,7 +148,7 @@ func replaceFunc(input string) string {
 			} else {
 				repl, err = dynamodbQuery(table, matches[i])
 				if err != nil {
-					log.Println(err)
+					log.Fatal(err)
 					return ""
 				}
 			}
@@ -158,7 +158,7 @@ func replaceFunc(input string) string {
 	if mod == modDecrypt {
 		repl, err = kmsDecrypt(repl)
 		if err != nil {
-			log.Println(err)
+			log.Fatal(err)
 			return ""
 		}
 	}
